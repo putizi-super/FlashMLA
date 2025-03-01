@@ -9,7 +9,7 @@ namespace flash {
 
 enum class NamedBarriers {
     SReady = 1,
-    SoftmaxReady = 2,
+    SoftmaxReady = 2,  // 用于同步Softmax计算完成状态
 };
 
 } // flash

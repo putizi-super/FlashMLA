@@ -65,6 +65,10 @@ static __device__ __forceinline__ T run(T x, Operator &op) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+/**
+ * 执行分块矩阵乘法
+   用于计算矩阵乘法，支持分块加载和累加操作
+ */
 template <bool zero_init=false, int wg_wait=0, bool arrive=true, bool commit=true, typename Tensor0, typename Tensor1, typename Tensor2, typename TiledMma>
 __forceinline__ __device__ void gemm(TiledMma &tiled_mma, Tensor0 const &tCrA, Tensor1 const &tCrB, Tensor2 &tCrC) {
     constexpr bool Is_RS = !cute::is_base_of<cute::GMMA::DescriptorIterator, typename TiledMma::FrgTypeA>::value;
@@ -100,7 +104,11 @@ __forceinline__ __device__ void gemm(TiledMma &tiled_mma, Tensor0 const &tCrA, T
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-
+// 张量布局转换
+/**
+ * 转换张量的布局，以便更好地适应计算需求
+ * 根据不同的硬件架构和张量布局，生成新的布局结构
+ */
 // For SM80, convert acc_layout from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
 // For SM90, convert acc_layout from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
 template<bool Transposed=false, typename Layout0>
@@ -116,7 +124,7 @@ __forceinline__ __device__ auto convert_layout_acc_rowcol(Layout0 acc_layout) {
              return make_layout(make_layout(get<0, 0>(l), get<0, 2>(l), get<2>(l)), make_layout(get<0, 1>(l), get<1>(l)));
         }
 
-    } else {  // SM80
+    } else {  // SM80 支持 A100
         static_assert(decltype(size<0>(acc_layout))::value == 4);
         static_assert(decltype(rank(acc_layout))::value == 3);
         auto l = logical_divide(acc_layout, Shape<_2>{});  // ((2, 2), MMA_M, MMA_N)
@@ -130,6 +138,10 @@ __forceinline__ __device__ auto convert_layout_acc_rowcol(Layout0 acc_layout) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+/**
+ * 转换张量的布局，以便更好地适应寄存器块操作
+ * 根据不同的硬件架构和张量布局，生成新的布局结构
+ */
 // For SM80, convert acc_layout from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
 // if using m16n8k16, or to (4, MMA_M, MMA_N) if using m16n8k8.
 // For SM90, FP16/BF16, convert acc_layout from ((2, 2, N / 8), MMA_M, MMA_N) to ((2, 2, 2), MMA_M, (N / 16, MMA_N))
@@ -175,7 +187,10 @@ __forceinline__ __device__ auto convert_layout_acc_Aregs(Layout0 acc_layout) {
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-
+// 类型转换
+/**
+ * 转换张量的数据类型，用于将张量的数据类型转换为指定的目标类型
+ */
 template <typename To_type, typename Engine, typename Layout>
 __forceinline__ __device__ auto convert_type(Tensor<Engine, Layout> const &tensor) {
     using From_type = typename Engine::value_type;
@@ -187,7 +202,7 @@ __forceinline__ __device__ auto convert_type(Tensor<Engine, Layout> const &tenso
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-
+// 异步内存拷贝，用于确保异步拷贝操作完成后再继续执行
 // Blocks until all but N previous cp.async.commit_group operations have committed.
 // This differs from cute::cp_async_wait in that when N = 0 we don't call cp.async.wait_all
 // (which is equivalent to commit_group then wait_group 0).

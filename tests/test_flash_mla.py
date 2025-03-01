@@ -1,14 +1,13 @@
-import argparse
 import math
 import random
 
 import torch
 import triton
 
-from flash_mla import flash_mla_with_kvcache, get_mla_metadata
+from flash_mla import get_mla_metadata, flash_mla_with_kvcache
 
 
-def scaled_dot_product_attention(query, key, value, h_q, h_kv, is_causal=False):
+def scaled_dot_product_attention(query, key, value, is_causal=False):
     query = query.float()
     key = key.float()
     value = value.float()
@@ -39,9 +38,7 @@ def cal_diff(x: torch.Tensor, y: torch.Tensor, name: str) -> None:
 
 @torch.inference_mode()
 def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen):
-    print(
-        f"{b=}, {s_q=}, {mean_sk=}, {h_q=}, {h_kv=}, {d=}, {dv=}, {causal=}, {varlen=}"
-    )
+    print(f"{b=}, {s_q=}, {mean_sk=}, {h_q=}, {h_kv=}, {d=}, {dv=}, {causal=}, {varlen=}")
 
     cache_seqlens = torch.full((b,), mean_sk, dtype=torch.int32)
     if varlen:
@@ -55,30 +52,18 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen):
 
     q = torch.randn(b, s_q, h_q, d)
     block_size = 64
-    block_table = torch.arange(
-        b * max_seqlen_pad // block_size, dtype=torch.int32
-    ).view(b, max_seqlen_pad // block_size)
+    block_table = torch.arange(b * max_seqlen_pad // block_size, dtype=torch.int32).view(b, max_seqlen_pad // block_size)
     blocked_k = torch.randn(block_table.numel(), block_size, h_kv, d)
     for i in range(b):
-        blocked_k.view(b, max_seqlen_pad, h_kv, d)[i, cache_seqlens[i].item():] = (
-            float("nan")
-        )
+        blocked_k.view(b, max_seqlen_pad, h_kv, d)[i, cache_seqlens[i].item():] = float("nan")
     blocked_v = blocked_k[..., :dv]
 
-    tile_scheduler_metadata, num_splits = get_mla_metadata(
-        cache_seqlens, s_q * h_q // h_kv, h_kv
-    )
+    tile_scheduler_metadata, num_splits = get_mla_metadata(cache_seqlens, s_q * h_q // h_kv, h_kv)
 
     def flash_mla():
         return flash_mla_with_kvcache(
-            q,
-            blocked_k,
-            block_table,
-            cache_seqlens,
-            dv,
-            tile_scheduler_metadata,
-            num_splits,
-            causal=causal,
+            q, blocked_k, block_table, cache_seqlens, dv,
+            tile_scheduler_metadata, num_splits, causal=causal,
         )
 
     def ref_mla():
@@ -91,8 +76,6 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen):
                 q[i].transpose(0, 1),
                 blocked_k.view(-1, h_kv, d)[begin:end].transpose(0, 1),
                 blocked_v.view(-1, h_kv, dv)[begin:end].transpose(0, 1),
-                h_q=h_q,
-                h_kv=h_kv,
                 is_causal=causal,
             )
             out[i] = O.transpose(0, 1)
@@ -104,19 +87,16 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen):
     cal_diff(out_flash, out_torch, "out")
     cal_diff(lse_flash, lse_torch, "lse")
 
-    t = triton.testing.do_bench(flash_mla)
+    t = triton.testing.do_bench(flash_mla, fast_flush=False)
     FLOPS = s_q * total_seqlens * h_q * (d + dv) * 2
-    bytes = (total_seqlens * h_kv * d + b * s_q * h_q * d + b * s_q * h_q * dv) * (
-        torch.finfo(q.dtype).bits // 8
-    )
-    print(
-        f"{t:.3f} ms, {FLOPS / 10 ** 9 / t:.0f} TFLOPS, {bytes / 10 ** 6 / t:.0f} GB/s"
-    )
+    bytes = (total_seqlens * h_kv * d + b * s_q * h_q * d + b * s_q * h_q * dv) * (torch.finfo(dtype).bits // 8)
+    print(f"{t:.3f} ms, {FLOPS / 10 ** 9 / t:.0f} TFLOPS, {bytes / 10 ** 6 / t:.0f} GB/s")
 
 
-def main(torch_dtype):
+if __name__ == "__main__":
+    dtype = torch.bfloat16
     device = torch.device("cuda:0")
-    torch.set_default_dtype(torch_dtype)
+    torch.set_default_dtype(dtype)
     torch.set_default_device(device)
     torch.cuda.set_device(device)
     torch.manual_seed(0)
@@ -132,22 +112,3 @@ def main(torch_dtype):
                 for s_q in [1, 2]:  # MTP = 1, 2
                     for varlen in [False, True]:
                         test_flash_mla(b, s_q, s, h_q, h_kv, d, dv, causal, varlen)
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--dtype",
-        type=str,
-        choices=["bf16", "fp16"],
-        default="bf16",
-        help="Data type to use for testing (bf16 or fp16)",
-    )
-
-    args = parser.parse_args()
-
-    torch_dtype = torch.bfloat16
-    if args.dtype == "fp16":
-        torch_dtype = torch.float16
-
-    main(torch_dtype)

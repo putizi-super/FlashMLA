@@ -3,5 +3,3 @@ build
 *.egg-info/
 __pycache__/
 dist/
-*perf.csv
-*.png

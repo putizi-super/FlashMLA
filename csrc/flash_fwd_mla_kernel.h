@@ -13,35 +13,43 @@ using namespace cute;
 #include "static_switch.h"
 #include "flash_mla.h"
 
-
+/**
+ * 根据 Head Dim 的大小，返回合适的共享内存布局类型，用于优化张量在共享内存中的存储和访问模式
+ */
 template<typename PrecType, int DIM, int DIM2 = DIM>
 constexpr auto getSmemLayoutK() {
     constexpr int headSizeBytes = sizeof(PrecType) * DIM;
     constexpr int headSizeBytes2 = sizeof(PrecType) * DIM2;
 
     if constexpr (headSizeBytes % 128 == 0 && headSizeBytes2 % 128 == 0) {
-        return GMMA::Layout_K_SW128_Atom<PrecType>{};
+        return GMMA::Layout_K_SW128_Atom<PrecType>{}; // 128字节对齐
     } else if constexpr (headSizeBytes % 64 == 0 && headSizeBytes2 % 64 == 0) {
-        return GMMA::Layout_K_SW64_Atom<PrecType>{};
+        return GMMA::Layout_K_SW64_Atom<PrecType>{}; // 64字节对齐
     } else {
-        return GMMA::Layout_K_SW32_Atom<PrecType>{};
+        return GMMA::Layout_K_SW32_Atom<PrecType>{}; // 32字节对齐
     }
 }
 
+/**
+ * 定义内核的特性参数，包括线程数量、分块大小、张量布局等，用于配置 GPU 的计算资源和张量操作的优化策略
+ */
 template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, typename elem_type=cutlass::bfloat16_t, int kHeadDimV_ = 0>
 struct Flash_fwd_kernel_traits_mla {
     using Element = elem_type;
     using ElementAccum = float;
     using index_t = int64_t;
 
+    // 分块大小，用于矩阵乘法和注意力计算
     static constexpr int kNWarps = kNWarps_;
     static constexpr int kNThreads = kNWarps * 32;
     static constexpr int kNWarpsS = 4;
     static constexpr int kNThreadsS = kNWarpsS * 32;
 
+    // 头维度大小，确保是 32 的倍数
     static constexpr int kBlockM = kBlockM_;
     static constexpr int kBlockN = kBlockN_;
     static constexpr int kHeadDim = kHeadDim_;
+    // 确保 head dim 大小是 32 的倍数
     static_assert(kHeadDim % 32 == 0);
     static constexpr int kHeadDimV = kHeadDimV_ != 0 ? kHeadDimV_ : kHeadDim;
     static_assert(kHeadDimV % 32 == 0);
@@ -49,28 +57,37 @@ struct Flash_fwd_kernel_traits_mla {
     static constexpr int kBlockKSmem = kHeadDim % 64 == 0 ? 64 : 32;
     static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
 
+    // 定义张量操作和布局类型，分块矩阵乘法和矩阵乘加操作的类型
+    // 分块矩阵乘法操作
     using TiledMma = decltype(make_tiled_mma(
             cute::GMMA::ss_op_selector<Element, Element, ElementAccum, Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>,
                     GMMA::Major::K, GMMA::Major::K>(),
             Layout<Shape<Int<kNWarpsS / 4>, _1, _1>>{}));
 
+    // 分块矩阵乘加操作
     static constexpr int AtomLayoutNO = kNThreads / kNThreadsS;
     using TiledMmaO = decltype(make_tiled_mma(
             cute::GMMA::rs_op_selector<Element, Element, ElementAccum, Shape<Int<kBlockM>, Int<kHeadDimV / AtomLayoutNO>, Int<kBlockN>>,
                     GMMA::Major::K, GMMA::Major::MN>(),
             Layout<Shape<Int<kNWarpsS / 4>, Int<AtomLayoutNO>, _1>>{}));
 
+    // 共享内存布局类型，用于优化张量在共享内存中的存储和访问
+    // Query 的共享内存布局
     using SmemLayoutQ = decltype(tile_to_shape(
             getSmemLayoutK<Element, kHeadDim>(),
             Shape<Int<kBlockM>, Int<kHeadDim>>{}));
 
+    // Key 的共享内存布局
     using SmemLayoutK = decltype(tile_to_shape(
             getSmemLayoutK<Element, kHeadDim, kHeadDimV>(),
             Shape<Int<kBlockN>, Int<kHeadDim>>{}));
 
+    // Value 的共享内存布局
     using SmemLayoutV = decltype(tile_to_shape(
             getSmemLayoutK<Element, kHeadDim, kHeadDimV>(),
             Shape<Int<kBlockN>, Int<kHeadDimV>>{}));
+
+    // 转置后的 Value 的共享内存布局
     using SmemLayoutVtransposed = decltype(composition(SmemLayoutV{}, make_layout(Shape<Int<kHeadDimV>, Int<kBlockN>>{}, GenRowMajor{})));
 
     using SmemLayoutP = Layout<Shape<Shape<_2, _2>, Int<kNThreadsS>, _1, Int<kBlockN / 8>>>;
@@ -123,16 +140,21 @@ namespace flash {
 
 using namespace cute;
 
+/**
+ * 定义共享内存的存储结构，用于在 GPU 内核中存储中间计算结果
+ */
 template<typename Kernel_traits>
 struct SharedStorageMLA {
     union {
         struct {
+            // 分别存储 Query、Key 和中间结果
             cute::array_aligned<typename Kernel_traits::Element, cute::cosize_v<typename Kernel_traits::SmemLayoutQ>> smem_q;
             cute::array_aligned<typename Kernel_traits::Element, cute::cosize_v<typename Kernel_traits::SmemLayoutK> * 2> smem_k;  // Double buffer
             cute::array_aligned<typename Kernel_traits::Element, cute::cosize_v<typename Kernel_traits::SmemLayoutP>> smem_p;
             cute::array_aligned<typename Kernel_traits::ElementAccum, cute::cosize_v<typename Kernel_traits::SmemLayoutRow>> smem_scale;
         };
         struct {
+            // 用于存储 Softmax 计算的中间结果
             cute::array_aligned<typename Kernel_traits::ElementAccum, cute::cosize_v<typename Kernel_traits::SmemLayoutRow>> smem_max;
             cute::array_aligned<typename Kernel_traits::ElementAccum, cute::cosize_v<typename Kernel_traits::SmemLayoutRow>> smem_sum;
             cute::array_aligned<typename Kernel_traits::ElementAccum, cute::cosize_v<typename Kernel_traits::SmemLayoutO>> smem_o;
@@ -142,6 +164,11 @@ struct SharedStorageMLA {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+/**
+ * 将计算结果存储到全局内存或中间缓存中
+ * 用于将张量数据从共享内存或线程寄存器中复制到全局内存或中间缓存中
+ * 支持 Split 和非 Split 的存储策略
+ */
 template<typename Kernel_traits, bool Split, typename SharedStorage, typename AccO, typename Softmax>
 __forceinline__ __device__ void store(const Flash_fwd_mla_params &params, const int bidb, const int bidh, const int m_block, const int n_split_idx,
                                       SharedStorage &shared_storage, AccO tOrO, Softmax softmax) {
@@ -192,6 +219,7 @@ __forceinline__ __device__ void store(const Flash_fwd_mla_params &params, const 
     Tensor gLSEaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(Split ? params.softmax_lseaccum_ptr : params.softmax_lse_ptr) + (Split ? row_offset_lseaccum : row_offset_lse)),
                                    Shape<Int<kBlockM>>{}, Stride<_1>{});
 
+    // 模板化处理不同类型的张量复制操作
     using GmemTiledCopyO = std::conditional_t<!Split, typename Kernel_traits::GmemTiledCopyO, typename Kernel_traits::GmemTiledCopyOaccum>;
     GmemTiledCopyO gmem_tiled_copy_Oaccum;
     auto gmem_thr_copy_Oaccum = gmem_tiled_copy_Oaccum.get_thread_slice(tidx);
@@ -228,6 +256,10 @@ __forceinline__ __device__ void store(const Flash_fwd_mla_params &params, const 
     );
 }
 
+/**
+ * 计算单行块的注意力机制，并支持 Split 和非 Split 的 KV 缓存
+ * Flash-MLA 内核的核心计算部分，负责处理注意力的计算、归一化和输出
+ */
 template<typename Kernel_traits, bool Is_causal, typename SharedStorage>
 __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_fwd_mla_params &params,
                                                                    const int bidb, const int bidh, const int m_block,
@@ -247,6 +279,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
     const int tidx = threadIdx.x;
     int n_block = n_block_max - 1;
 
+    // 定义张量布局和数据存储
     Tensor sQ = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), typename Kernel_traits::SmemLayoutQ{});
     Tensor sK = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), typename Kernel_traits::SmemLayoutK{});
     Tensor sV = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), typename Kernel_traits::SmemLayoutV{});
@@ -271,18 +304,21 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
 
     int warp_group_idx = cutlass::canonical_warp_group_idx();
     if (warp_group_idx == 0) {
+        // 主要计算逻辑，包括矩阵乘法、归一化、概率矩阵的计算和输出
         typename Kernel_traits::TiledMma tiled_mma;
         auto thr_mma = tiled_mma.get_thread_slice(tidx);
         Tensor tSrQ = thr_mma.partition_fragment_A(sQ);                           // (MMA,MMA_M,MMA_K)
         Tensor tSrK = thr_mma.partition_fragment_B(sK);                           // (MMA,MMA_N,MMA_K)
 
         if (n_block % 2 == 1) {
+            // 双缓冲策略：切换到第二个缓冲区
             // Double buffer for sK
             constexpr int sK_offset = size(sK);
             tSrK.data() = tSrK.data() + sK_offset / 8;
             tOrVt.data() = tOrVt.data() + sK_offset / 8;
         }
 
+        // 计算注意力分数
         // We need masking on S for the very last block when K and V has length not multiple of kBlockN.
         // We also need masking on S if it's causal, for the last ceil_div(kBlockM, kBlockN) blocks.
         // We will have at least 1 "masking" iteration.
@@ -303,7 +339,9 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
                 Tensor cS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
                 Tensor tScS = thr_mma.partition_C(cS);
 #pragma unroll
+                // 应用掩码（Mask）和计算概率矩阵
                 for (int i = 0; i < size(tSrS); ++i) {
+                    // 因果掩码（Causal Mask），确保只关注当前和过去的 token
                     if constexpr (!Is_causal) {  // Just masking based on col
                         if (int(get<1>(tScS(i))) >= int(seqlen_k - n_block * kBlockN)) tSrS(i) = -INFINITY;
                     } else {
@@ -315,25 +353,28 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
                     }
                 }
             }
-
+            
+            // 计算 Softmax 的最大值和归一化因子
             // We have key_padding_mask so we'll need to Check_inf
             Tensor scale_o = is_first_masking_step
                              ? softmax.template softmax</*Is_first=*/true,  /*Check_inf=*/Is_causal>(tSrS, params.scale_softmax_log2)
                              : is_masking_step ?
                                softmax.template softmax</*Is_first=*/false, /*Check_inf=*/Is_causal>(tSrS, params.scale_softmax_log2)
                                                : softmax.template softmax</*Is_first=*/false, /*Check_inf=*//*Is_local=*/false>(tSrS, params.scale_softmax_log2);
-
+            // 存储 Softmax 的概率值和归一化因子
             Tensor rP = flash::convert_type<Element>(tSrS);
             cute::copy(rP, tPsP);
             cute::copy(scale_o, tScale_osScale_o);
-
+            // 同步线程，确保计算结果一致
             cutlass::arch::NamedBarrier::arrive(kNThreads, static_cast<int>(NamedBarriers::SReady));
-
+            // 计算 Output
             flash::rescale_o(tOrO, scale_o);
 
             Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
+             // 转换布局后的概率张量
             flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_o, tOrP, tOrVt, tOrO);
 
+            // 双缓冲切换
             // Double buffer for sK
             const int sK_offset = n_block % 2 == 0 ? size(sK) : -size(sK);
             tSrK.data() = tSrK.data() + sK_offset / 8;
@@ -347,6 +388,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
         const int *block_table = params.block_table + bidb * params.block_table_batch_stride;
         int cur_block_table = __ldg(&block_table[n_block]);
 
+        // 加载 Query 数据
         const index_t row_offset_q = bidb * params.q_batch_stride + m_block * kBlockM * params.q_row_stride + bidh * params.q_head_stride;
         Tensor gQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.q_ptr) + row_offset_q),
                                 Shape<Int<kBlockM>, Int<kHeadDim>>{},
@@ -359,10 +401,11 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
         Tensor tQcQ = gmem_thr_copy_Q.partition_S(cQ);  // (ACPY,ACPY_M,ACPY_K) -> (blk_m,blk_k)
         Tensor tQpQ = make_tensor<bool>(make_shape(size<2>(tQsQ)));
 
+        // 将 Query 数据加载到共享内存
         // We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
         flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/true>(gmem_tiled_copy_Q, tQgQ, tQsQ, tQcQ, tQpQ,
                                                               params.seqlen_q - m_block * kBlockM);
-
+        // 加载 Key 数据
         const index_t row_offset_k = (bidh / params.h_h_k_ratio) * params.k_head_stride;
         Tensor gK = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.k_ptr) + row_offset_k),
                                 Shape<Int<kBlockN>, Int<kHeadDim>>{},
@@ -376,12 +419,14 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
         Tensor tKpK = make_tensor<bool>(make_shape(size<2>(tKsK)));
 
         if (n_block % 2 == 1) {
+            // 双缓冲策略：切换到第二个缓冲区
             // Double buffer for sK
             constexpr int sK_offset = size(sK);
             tKsK.data() = tKsK.data() + sK_offset;
             tOrVt.data() = tOrVt.data() + sK_offset / 8;
         }
 
+        // 将 Key 数据加载到共享内存
         // We need to clear the sK smem tiles because K is V.
         const index_t offset_k = cur_block_table * params.k_batch_stride;
         tKgK.data() = tKgK.data() + offset_k;
@@ -394,12 +439,14 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
             cur_block_table = __ldg(&block_table[n_block - 1]);
         }
 
+// 同步线程
 #pragma unroll 1
         for (; n_block >= n_block_min; --n_block) {
             flash::cp_async_wait<0>();
             __syncthreads();
 
             if (n_block - 1 >= n_block_min) {
+                // 双缓冲策略：切换到下一个缓冲区
                 // Double buffer for sK
                 const int sK_offset = n_block % 2 == 0 ? size(sK) : -size(sK);
                 tKsK.data() = tKsK.data() + sK_offset;
@@ -411,12 +458,15 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
                 cute::cp_async_fence();
             }
 
+            // 同步线程组
             cutlass::arch::NamedBarrier::sync(kNThreads, static_cast<int>(NamedBarriers::SReady));
 
+            // 更新块索引
             if (n_block - 2 >= n_block_min) {
                 cur_block_table = __ldg(&block_table[n_block - 2]);
             }
 
+            // 计算 Attention Score
             typename Kernel_traits::TiledMma tiled_mma;
             auto tSrS_layout = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{}).layout();
             Tensor rP = make_tensor<Element>(tSrS_layout);
@@ -424,27 +474,35 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
             cute::copy(tScale_osScale_o, scale_o);
             cute::copy(tPsP, rP);
 
+             // 计算 Output
             flash::rescale_o(tOrO, scale_o);
 
             Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
             flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_o, tOrP, tOrVt, tOrO);
 
+            // 双缓冲切换
             // Double buffer for sK
             const int sK_offset = n_block % 2 == 0 ? size(sK) : -size(sK);
             tOrVt.data() = tOrVt.data() + sK_offset / 8;
         }
 
+        // 同步线程，准备存储结果
         cutlass::arch::NamedBarrier::sync(kNThreads, static_cast<int>(NamedBarriers::SoftmaxReady));
         cute::copy(tRow_maxsRow_max, softmax.row_max);
         cute::copy(tRow_sumsRow_sum, softmax.row_sum);
     }
 
+    // 存储结果
     if (NoSplit)
         store<Kernel_traits, false>(params, bidb, bidh, m_block, n_split_idx, shared_storage, tOrO, softmax);
     else
         store<Kernel_traits, true>(params, bidb, bidh, m_block, n_split_idx, shared_storage, tOrO, softmax);
 }
 
+/**
+ * Flash-MLA 内核入口函数，负责启动计算线程并分发任务
+ * 用于执行多头注意力机制的前向传播，支持 split-k 优化
+ */
 template<typename Kernel_traits, bool Is_causal, typename SharedStorage>
 __global__ void __launch_bounds__(Kernel_traits::kNThreads, 1, 1)
 flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params) {
@@ -456,6 +514,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
     extern __shared__ char shared_memory[];
     auto &shared_storage = *reinterpret_cast<SharedStorage *>(shared_memory);
 
+    // 获取元数据和块索引
     int *tile_scheduler_metadata_ptr = params.tile_scheduler_metadata_ptr + partition_idx * TileSchedulerMetaDataSize;
     int4 tile_scheduler_metadata = __ldg(reinterpret_cast<int4 *>(tile_scheduler_metadata_ptr));
     int begin_idx = tile_scheduler_metadata.x;
@@ -465,6 +524,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
     if (begin_idx >= params.b) return;
     int begin_n_split_idx = __ldg(tile_scheduler_metadata_ptr + 4);
 
+    // 主循环，处理多个批次
 #pragma unroll 1
     for (int batch_id = begin_idx; batch_id <= end_idx; ++batch_id) {
         const int n_split_idx = batch_id == begin_idx ? begin_n_split_idx : 0;
@@ -473,14 +533,20 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
         const int n_block_max = batch_id == end_idx ? cute::ceil_div(end_seqlen, kBlockN) : cute::ceil_div(seqlen_k, kBlockN);
         const bool NoSplit = n_block_min == 0 && n_block_max == cute::ceil_div(seqlen_k, kBlockN);
         if (batch_id > begin_idx) {
+            // 同步线程
             __syncthreads();  // Barrier between two tiles.
         }
+        // 计算单行块的注意力机制
         flash::compute_attn_1rowblock_splitkv_mla<Kernel_traits, Is_causal>(params, batch_id, bidh, m_block, n_split_idx, seqlen_k, n_block_min, n_block_max, NoSplit, shared_storage);
     }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+/**
+ * 合并 Split 的 KV 缓存结果，将多个块的输出合并到最终的 Output 和 LSE 张量中
+ * Flash-MLA 的后处理部分，确保输出数据的完整性和一致性
+ */
 template<typename Element, typename ElementAccum, typename index_t, int kHeadDimV, int kMaxSplits>
 __global__ void __launch_bounds__(256, 1, 1)
 flash_fwd_splitkv_mla_combine_kernel(__grid_constant__ const Flash_fwd_mla_params params) {
@@ -499,6 +565,7 @@ flash_fwd_splitkv_mla_combine_kernel(__grid_constant__ const Flash_fwd_mla_param
 
     __shared__ ElementAccum sLseScale[kMaxSplits];
 
+    // 加载 LSE 数据
     const index_t row_offset_lseaccum = split_offset * hs + hs_idx;
     const index_t row_offset_lse = bidx;
     Tensor gLSEaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lseaccum_ptr) + row_offset_lseaccum),
@@ -508,6 +575,7 @@ flash_fwd_splitkv_mla_combine_kernel(__grid_constant__ const Flash_fwd_mla_param
 
     int warp_idx = cutlass::canonical_warp_idx_sync();
     if (warp_idx == 0) {
+        // 计算全局 LSE 值
         constexpr int kNLsePerThread = cute::ceil_div(kMaxSplits, 32);
 
         float local_lse[kNLsePerThread];
@@ -519,9 +587,11 @@ flash_fwd_splitkv_mla_combine_kernel(__grid_constant__ const Flash_fwd_mla_param
         float max_lse = -INFINITY;
         for (int i = 0; i < kNLsePerThread; ++i) max_lse = max(max_lse, local_lse[i]);
         for (int offset = 16; offset >= 1; offset /= 2) max_lse = max(max_lse, __shfl_xor_sync(uint32_t(-1), max_lse, offset));
+        // 如果所有 LSE 值都是 -inf，则设置为 0
         max_lse = max_lse == -INFINITY ? 0.0f : max_lse;  // In case all local LSEs are -inf
 
         float sum_lse = 0;
+        // 计算缩放因子
         for (int i = 0; i < kNLsePerThread; ++i) sum_lse = sum_lse + expf(local_lse[i] - max_lse);
         for (int offset = 16; offset >= 1; offset /= 2) sum_lse = sum_lse + __shfl_xor_sync(uint32_t(-1), sum_lse, offset);
 
@@ -535,6 +605,7 @@ flash_fwd_splitkv_mla_combine_kernel(__grid_constant__ const Flash_fwd_mla_param
     }
     __syncthreads();
 
+    // 合并 Output 数据
     static_assert(kHeadDimV % kNThreads == 0);
     constexpr int Elements = kHeadDimV / kNThreads;
     const index_t row_offset_oaccum = (split_offset * hs + hs_idx) * kHeadDimV;
@@ -557,9 +628,11 @@ flash_fwd_splitkv_mla_combine_kernel(__grid_constant__ const Flash_fwd_mla_param
         for (int i = 0; i < size(tOrO); ++i) {
             tOrO(i) += lse_scale * tOrOaccum(i);
         }
+        // 指针跳跃到下一个 Split 的数据位置
         tOgOaccum.data() = tOgOaccum.data() + hs * kHeadDimV;
     }
 
+    // 将合并后的 Output 数据存储到全局内存
     Tensor rO = flash::convert_type<Element>(tOrO);
     const int head_idx = (bidx - batch_idx * hs) / params.seqlen_q;
     const int row = bidx - batch_idx * hs - head_idx * params.seqlen_q;
@@ -572,6 +645,9 @@ flash_fwd_splitkv_mla_combine_kernel(__grid_constant__ const Flash_fwd_mla_param
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+/**
+ * 启动 GPU 内核函数，执行多头注意力机制的前向传播
+ */
 template<typename Kernel_traits, typename SharedStorage>
 void run_flash_splitkv_fwd_mla(Flash_fwd_mla_params &params, cudaStream_t stream) {
     FLASH_ASSERT(params.page_block_size == Kernel_traits::kBlockN);
@@ -593,11 +669,104 @@ void run_flash_splitkv_fwd_mla(Flash_fwd_mla_params &params, cudaStream_t stream
     CHECK_CUDA_KERNEL_LAUNCH();
 }
 
+/**
+ * 运行多头注意力机制的前向传播，支持 split-k 优化
+ */
 template<typename T, int Headdim>
 void run_mha_fwd_splitkv_mla(Flash_fwd_mla_params &params, cudaStream_t stream) {
     static_assert(Headdim == 576);
     FLASH_ASSERT(params.d_v == 512);
     FLASH_ASSERT(params.k_ptr == params.v_ptr);  // Shared_KV
+
+    // 使用Kernel_traits定义内核特性
     using Kernel_traits = Flash_fwd_kernel_traits_mla<576, 64, 64, 8, T, 512>;
     run_flash_splitkv_fwd_mla<Kernel_traits, flash::SharedStorageMLA<Kernel_traits>>(params, stream);
+}
+
+static constexpr int MaxBatchSize = 4096;
+
+/**
+ * 获取元数据的内核函数，用于计算块分配元数据
+ * Flash-MLA 的辅助内核，负责处理元数据的计算
+ */
+__global__ void __launch_bounds__(256, 1, 1)
+get_mla_metadata_kernel(__grid_constant__ const Mla_metadata_params params) {
+    int *seqlens_k_ptr = params.seqlens_k_ptr;
+    int *tile_scheduler_metadata_ptr = params.tile_scheduler_metadata_ptr;
+    int *num_splits_ptr = params.num_splits_ptr;
+    int batch_size = params.batch_size;
+    int block_size_n = params.block_size_n;
+    int fixed_overhead_num_blocks = params.fixed_overhead_num_blocks;
+    int num_sm_parts = params.num_sm_parts;
+
+    __shared__ int num_blocks_shared[MaxBatchSize];
+    __shared__ int num_splits_shared[MaxBatchSize];
+
+    // 计算每个批次的块数量
+    int total_num_blocks = 0;
+    for (int i = threadIdx.x; i < batch_size; i += 32) {
+        int num_blocks = cutlass::ceil_div(seqlens_k_ptr[i], block_size_n);
+        total_num_blocks += num_blocks + fixed_overhead_num_blocks;
+        num_blocks_shared[i] = num_blocks;
+    }
+    for (int offset = 16; offset >= 1; offset /= 2) {
+        total_num_blocks += __shfl_xor_sync(uint32_t(-1), total_num_blocks, offset);
+    }
+    __syncwarp();
+
+    if (threadIdx.x == 0) {
+        // 计算负载均衡参数
+        int payload = cutlass::ceil_div(total_num_blocks, num_sm_parts) + fixed_overhead_num_blocks;
+
+        int now_idx = 0, now_block = 0, now_n_split_idx = 0, cum_num_splits = 0;
+        num_splits_shared[0] = 0;
+        // 分配 SM
+        for (int i = 0; i < num_sm_parts; ++i) {
+            int tile_scheduler_metadata0[4], tile_scheduler_metadata1;
+            tile_scheduler_metadata0[0] = now_idx;
+            tile_scheduler_metadata0[1] = now_block * block_size_n;
+            tile_scheduler_metadata1 = now_n_split_idx;
+            int remain_payload = payload;
+            while (now_idx < batch_size) {
+                int num_blocks = num_blocks_shared[now_idx];
+                int now_remain_blocks = num_blocks - now_block;
+                if (remain_payload >= now_remain_blocks + fixed_overhead_num_blocks) {
+                    cum_num_splits += now_n_split_idx + 1;
+                    num_splits_shared[now_idx + 1] = cum_num_splits;
+                    remain_payload -= now_remain_blocks + fixed_overhead_num_blocks;
+                    ++now_idx;
+                    now_block = 0;
+                    now_n_split_idx = 0;
+                } else {
+                    if (remain_payload - fixed_overhead_num_blocks > 0) {
+                        now_block += remain_payload - fixed_overhead_num_blocks;
+                        ++now_n_split_idx;
+                        remain_payload = 0;
+                    }
+                    break;
+                }
+            }
+            tile_scheduler_metadata0[2] = now_block > 0 ? now_idx : now_idx - 1;
+            tile_scheduler_metadata0[3] = now_block > 0 ? now_block * block_size_n : seqlens_k_ptr[now_idx - 1];
+            *reinterpret_cast<int4 *>(tile_scheduler_metadata_ptr + i * TileSchedulerMetaDataSize) = *reinterpret_cast<int4 *>(tile_scheduler_metadata0);
+            tile_scheduler_metadata_ptr[i * TileSchedulerMetaDataSize + 4] = tile_scheduler_metadata1;
+        }
+        FLASH_DEVICE_ASSERT(now_idx == batch_size && now_block == 0 && now_n_split_idx == 0);
+    }
+    __syncwarp();
+
+    // 将结果写入 num_splits 数组
+    for (int i = threadIdx.x; i <= batch_size; i += 32) {
+        num_splits_ptr[i] = num_splits_shared[i];
+    }
+}
+
+/**
+ * 触发元数据计算内核的执行
+ * Flash-MLA 的辅助函数，负责启动元数据计算内核
+ */
+void get_mla_metadata_func(Mla_metadata_params &params, cudaStream_t stream) {
+    FLASH_ASSERT(params.batch_size < MaxBatchSize);
+    get_mla_metadata_kernel<<<1, 32, 0, stream>>>(params);
+    CHECK_CUDA_KERNEL_LAUNCH();
 }

@@ -15,6 +15,10 @@ using namespace cute;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+/**
+ * 对张量进行线程级的 reduce 操作
+ * 函数用于在线程内部进行数据的聚合操作，例如求和、求最大值等
+ */
 template<bool zero_init=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1, typename Operator>
 __device__ __forceinline__ void thread_reduce_(Tensor<Engine0, Layout0> const &tensor, Tensor<Engine1, Layout1> &summary, Operator &op) {
     static_assert(Layout0::rank == 2, "Only support 2D Tensor");
@@ -30,6 +34,10 @@ __device__ __forceinline__ void thread_reduce_(Tensor<Engine0, Layout0> const &t
     }
 }
 
+/**
+ * 在 warp 内执行 all-reduce 操作
+ * 函数用于跨线程聚合数据，确保线程间的数据一致性
+ */
 template<typename Engine0, typename Layout0, typename Engine1, typename Layout1, typename Operator>
 __device__ __forceinline__ void quad_allreduce_(Tensor<Engine0, Layout0> &dst, Tensor<Engine1, Layout1> &src, Operator &op) {
     CUTE_STATIC_ASSERT_V(size(dst) == size(src));
@@ -39,24 +47,37 @@ __device__ __forceinline__ void quad_allreduce_(Tensor<Engine0, Layout0> &dst, T
     }
 }
 
+/**
+ * 对张量进行 reduce 操作
+ * 用于聚合张量中的数据，例如求和、求最大值等
+ */
 template<bool zero_init=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1, typename Operator>
 __device__ __forceinline__ void reduce_(Tensor<Engine0, Layout0> const& tensor, Tensor<Engine1, Layout1> &summary, Operator &op) {
     thread_reduce_<zero_init>(tensor, summary, op);
     quad_allreduce_(summary, summary, op);
 }
 
+/**
+ * 对张量求最大值，数用于计算张量中的最大值
+ */
 template<bool zero_init=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
 __device__ __forceinline__ void reduce_max(Tensor<Engine0, Layout0> const& tensor, Tensor<Engine1, Layout1> &max){
     MaxOp<float> max_op;
     reduce_<zero_init>(tensor, max, max_op);
 }
 
+/**
+ * 用于计算张量中数据的和
+ */
 template<bool zero_init=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
 __device__ __forceinline__ void reduce_sum(Tensor<Engine0, Layout0> const& tensor, Tensor<Engine1, Layout1> &sum){
     SumOp<float> sum_op;
     thread_reduce_<zero_init>(tensor, sum, sum_op);
 }
 
+/**
+ * 对张量应用指数运算，用于将张量中的数据转换为指数形式，并根据给定的最大值进行缩放
+ */
 // Apply the exp to all the elements.
 template <bool Scale_max=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
 __forceinline__ __device__ auto scale_apply_exp2(Tensor<Engine0, Layout0> &tensor, Tensor<Engine1, Layout1> const &max, const float scale) {
@@ -71,6 +92,7 @@ __forceinline__ __device__ auto scale_apply_exp2(Tensor<Engine0, Layout0> &tenso
         const float max_scaled = max(mi) == -INFINITY ? 0.f : max(mi) * (Scale_max ? scale : float(M_LOG2E));
         #pragma unroll
         for (int ni = 0; ni < size<1>(tensor); ++ni)  {
+            // 使用 exp2f 函数进行指数运算，提高计算效率
             // Instead of computing exp(x - max), we compute exp2(x * log_2(e) -
             // max * log_2(e)) This allows the compiler to use the ffma
             // instruction instead of fadd and fmul separately.
@@ -87,6 +109,9 @@ __forceinline__ __device__ auto scale_apply_exp2(Tensor<Engine0, Layout0> &tenso
     return tensor;
 }
 
+/**
+ * 计算张量的最大值、指数运算和和
+ */
 // Apply the exp to all the elements.
 template <bool zero_init=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
 __forceinline__ __device__ void max_scale_exp2_sum(Tensor<Engine0, Layout0> &tensor, Tensor<Engine1, Layout1> &max, Tensor<Engine1, Layout1> &sum, const float scale) {
@@ -119,6 +144,10 @@ __forceinline__ __device__ void max_scale_exp2_sum(Tensor<Engine0, Layout0> &ten
     }
 }
 
+/**
+ * 对张量应用缩放操作
+ * 用于将 Output 张量中的数据根据缩放因子进行缩放
+ */
 template<typename Tensor0, typename Tensor1>
 __forceinline__ __device__ void rescale_o(Tensor0 &acc_o, Tensor1 &scale_o) {
     // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
@@ -136,27 +165,33 @@ template <int kNRows>
 struct Softmax {
 
     using TensorT = decltype(make_tensor<float>(Shape<Int<kNRows>>{}));
+     // 每行的最大值和和
     TensorT row_max, row_sum;
 
     __forceinline__ __device__ Softmax() {};
 
     template<bool Is_first, bool Check_inf=false, typename Tensor0>
     __forceinline__ __device__ TensorT softmax(Tensor0 &acc_s, float softmax_scale_log2) {
+        // 计算 Softmax 的分值
+        // 这是 Softmax 计算的核心部分，用于计算概率矩阵
         // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
         static_assert(decltype(size<0>(scores))::value == kNRows);
         TensorT scale_o;
         clear(scale_o);
+        // 计算每行的最大值
         if (Is_first) {
             flash::template reduce_max</*zero_init=*/true>(scores, row_max);
             flash::scale_apply_exp2(scores, row_max, softmax_scale_log2);
             flash::reduce_sum</*zero_init=*/true>(scores, row_sum);
         } else {
+            // 使用之前的最大值进行计算
             Tensor scores_max_prev = make_fragment_like(row_max);
             cute::copy(row_max, scores_max_prev);
             flash::template reduce_max</*zero_init=*/false>(scores, row_max);
             // Reshape acc_o from (MMA=4, MMA_M, MMA_K) to (nrow=(2, MMA_M), ncol=(2, MMA_K))
             #pragma unroll
+            // 应用缩放因子
             for (int mi = 0; mi < size(row_max); ++mi) {
                 float scores_max_cur = !Check_inf
                     ? row_max(mi)
@@ -173,6 +208,8 @@ struct Softmax {
         return scale_o;
     };
 
+    // 归一化 Softmax 的输出
+    // 这个函数用于将 Softmax 的输出归一化为概率值，并支持 Dropout 操作
     template<bool Is_dropout=false, bool Split=false, typename Tensor0>
     __forceinline__ __device__ TensorT normalize_softmax_lse(Tensor0 &acc_o, float softmax_scale, float rp_dropout=1.0) {
         SumOp<float> sum_op;
